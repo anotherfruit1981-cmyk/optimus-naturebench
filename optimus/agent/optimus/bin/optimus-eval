@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""optimus-eval --family <method-family> "<what changed>"
+
+Evaluate the current /workspace/output through the NatureBench evaluation
+service (POST /evaluate, exactly like the raw curl call), and additionally:
+  * snapshot the output directory so the best output for each instance can be
+    reassembled later (optimus-assemble),
+  * append the attempt, its method family and your note to
+    /workspace/optimus_ledger.md,
+  * print the score, the best score, per-instance scores, the phase of the run
+    and any OPTIMUS directives (diversity, plateau, threshold).
+
+--family names the method family (e.g. "gbm-on-features", "gnn",
+"pretrained-embeddings+ridge", "hmrf-mixture"). If omitted, the previous
+attempt's family is reused.
+"""
+import os
+import shutil
+import sys
+
+sys.path.insert(0, os.environ.get("OPTIMUS_HOME", "/opt/optimus"))
+import optimus_common as oc  # noqa: E402
+
+
+def parse_args(argv):
+    family = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--family", "-f") and i + 1 < len(argv):
+            family = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--family="):
+            family = a.split("=", 1)[1]
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    return family, " ".join(rest).strip()
+
+
+def main() -> int:
+    family, note = parse_args(sys.argv[1:])
+    note = note or "(no note)"
+    rows_before = oc.read_ledger()
+    family_given = bool(family and family.strip())
+    if not family_given:
+        family = rows_before[-1].get("family", "untagged") if rows_before else "untagged"
+    family = family.strip().lower().replace(" ", "-")
+
+    out = oc.OUTPUT_DIR
+    if not out.exists() or not any(out.iterdir()):
+        print(f"[optimus-eval] {out} is missing or empty. Run your pipeline first; "
+              "an empty submission scores -1 per instance.")
+        return 2
+
+    # Snapshot before evaluating, so the snapshot is exactly what was scored.
+    tmp_snap = oc.SNAP_DIR / "_pending"
+    snapped = False
+    size = oc.dir_size(out)
+    free = oc.disk_free()
+    if size <= oc.SNAP_MAX_BYTES and (free < 0 or free - size > oc.SNAP_MIN_FREE_BYTES):
+        shutil.rmtree(tmp_snap, ignore_errors=True)
+        try:
+            shutil.copytree(out, tmp_snap)
+            snapped = True
+        except OSError as err:
+            print(f"[optimus-eval] snapshot skipped ({err})")
+            shutil.rmtree(tmp_snap, ignore_errors=True)
+    else:
+        print(f"[optimus-eval] snapshot skipped (output {oc.gb(size)}, disk free {oc.gb(free)})")
+
+    print("[optimus-eval] POST /evaluate ...", flush=True)
+    res = oc.post_evaluate()
+    if "error" in res and "attempt" not in res:
+        shutil.rmtree(tmp_snap, ignore_errors=True)
+        print(f"[optimus-eval] evaluation error: {res.get('error')}")
+        return 1
+
+    attempt = int(res.get("attempt", 0))
+    g = res.get("aggregate_improvement")
+    per = res.get("per_instance_improvement") or {}
+    snap_final = oc.snapshot_path(attempt)
+    if snapped:
+        shutil.rmtree(snap_final, ignore_errors=True)
+        tmp_snap.rename(snap_final)
+
+    row = {
+        "attempt": attempt,
+        "elapsed_min": oc.elapsed_minutes(),
+        "g": g,
+        "per_instance": per,
+        "family": family,
+        "note": note,
+        "snapshot": snapped,
+        "source": "optimus-eval",
+    }
+    oc.append_ledger(row)
+    rows = oc.read_ledger()
+    oc.prune_snapshots(rows)
+
+    best = res.get("best_aggregate_improvement")
+    print(f"[optimus-eval] attempt {attempt} [{family}]: g = {oc.fmt_g(g)}   best = {oc.fmt_g(best)} "
+          f"(attempt {res.get('best_attempt')})")
+    if per:
+        print("[optimus-eval] per-instance: " + ", ".join(f"{k}={oc.fmt_g(v)}" for k, v in per.items()))
+    if not family_given:
+        print(f"[optimus-eval] no --family given; recorded as '{family}'. Tag new method families with --family.")
+    for line in oc.steering_lines(oc.steering(rows)):
+        print(line)
+    print(f"[optimus-eval] disk free: {oc.gb(oc.disk_free())}")
+    oc.mark_steered()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

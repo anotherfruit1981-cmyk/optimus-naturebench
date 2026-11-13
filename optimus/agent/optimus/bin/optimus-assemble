@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""optimus-assemble [--dry-run]
+
+Build a submission that takes, for each instance, the output of the logged
+attempt that scored best on that instance, then evaluate it with optimus-eval.
+
+Every snapshot was produced earlier in this run by your own fitted pipeline and
+scored through /evaluate, so this reuses earlier outputs rather than creating
+new predictions. A manifest of which attempt supplied each instance is written
+to /workspace/optimus_assembly.md. Only use this when every contributing
+attempt came from a valid, data-fitted method.
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.environ.get("OPTIMUS_HOME", "/opt/optimus"))
+import optimus_common as oc  # noqa: E402
+
+MIN_GAIN = 0.0005
+
+
+def main() -> int:
+    dry = "--dry-run" in sys.argv
+    rows = [r for r in oc.read_ledger() if r.get("g") is not None]
+    snap_rows = [r for r in rows if r.get("snapshot") and oc.snapshot_path(r["attempt"]).exists()]
+    if not snap_rows:
+        print("[optimus-assemble] no snapshotted attempts in the ledger; nothing to assemble.")
+        return 1
+    best_row = max(rows, key=lambda r: r["g"])
+    instances = list((best_row.get("per_instance") or {}).keys())
+    if len(instances) < 2:
+        print("[optimus-assemble] single-instance task: assembling cannot help.")
+        return 0
+
+    choice = {}
+    for inst in instances:
+        cands = [r for r in snap_rows if (r.get("per_instance") or {}).get(inst) is not None]
+        if not cands:
+            print(f"[optimus-assemble] no snapshot has a score for instance {inst}; aborting.")
+            return 1
+        r = max(cands, key=lambda r: r["per_instance"][inst])
+        choice[inst] = (r["attempt"], r["per_instance"][inst], r.get("note", ""))
+
+    predicted = sum(v for _a, v, _n in choice.values()) / len(choice)
+    print(f"[optimus-assemble] best single attempt: #{best_row['attempt']} g={oc.fmt_g(best_row['g'])}")
+    print(f"[optimus-assemble] per-instance assembly predicts g ~ {predicted:+.4f}")
+    for inst, (a, v, n) in choice.items():
+        print(f"    {inst}: attempt #{a} ({oc.fmt_g(v)}) :: {n}")
+    if predicted - best_row["g"] < MIN_GAIN:
+        print("[optimus-assemble] predicted gain too small; leaving the output unchanged.")
+        return 0
+    if dry:
+        return 0
+
+    for inst, (a, _v, _n) in choice.items():
+        if not (oc.snapshot_path(a) / inst).exists():
+            print(f"[optimus-assemble] snapshot of attempt #{a} has no '{inst}/' folder "
+                  "(outputs are not per-instance folders); aborting without changes.")
+            return 1
+
+    out = oc.OUTPUT_DIR
+    backup = oc.SNAP_DIR / "_pre_assemble_output"
+    shutil.rmtree(backup, ignore_errors=True)
+    if out.exists():
+        shutil.copytree(out, backup)
+        shutil.rmtree(out)
+    # Start from the best single attempt (keeps any top-level files), then
+    # replace each instance folder with its best-scoring snapshot.
+    shutil.copytree(oc.snapshot_path(best_row["attempt"]), out)
+    for inst, (a, _v, _n) in choice.items():
+        shutil.rmtree(out / inst, ignore_errors=True)
+        shutil.copytree(oc.snapshot_path(a) / inst, out / inst)
+
+    with open(oc.WORKSPACE / "optimus_assembly.md", "w", encoding="utf-8") as fh:
+        fh.write("# OPTIMUS per-instance assembly\n\n")
+        fh.write("Each instance's output is copied unchanged from the earlier attempt that scored best on it.\n\n")
+        fh.write("| instance | source attempt | instance g | method note |\n|---|---|---|---|\n")
+        for inst, (a, v, n) in choice.items():
+            fh.write(f"| {inst} | {a} | {oc.fmt_g(v)} | {str(n).replace('|', '/')} |\n")
+
+    sources = ", ".join(f"{i}<-#{a}" for i, (a, _v, _n) in choice.items())
+    rc = subprocess.call([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "optimus-eval"),
+                          f"per-instance assembly of earlier attempts ({sources})"])
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
